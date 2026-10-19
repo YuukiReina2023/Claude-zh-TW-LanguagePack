@@ -243,7 +243,17 @@ def copy_locale_files(resources_path, silent=False):
         if not silent:
             print("  → ion-dist/i18n/statsig/zh-TW.json (模型與功能提示文案)")
 
-    # 4. overrides.json
+    # 4. dynamic.json
+    dynamic_dir = os.path.join(i18n_dir, "dynamic")
+    os.makedirs(dynamic_dir, exist_ok=True)
+    dynamic_src = os.path.join(LOCALES_DIR, "dynamic.json")
+    if os.path.exists(dynamic_src):
+        shutil.copy2(dynamic_src, os.path.join(dynamic_dir, "zh-TW.json"))
+        shutil.copy2(dynamic_src, os.path.join(dynamic_dir, "zh-Hant.json"))
+        if not silent:
+            print("  → ion-dist/i18n/dynamic/zh-TW.json (模型推理與動態文案)")
+
+    # 5. overrides.json
     write_text_file(os.path.join(i18n_dir, "zh-TW.overrides.json"), "{}\n")
     write_text_file(os.path.join(i18n_dir, "zh-Hant.overrides.json"), "{}\n")
 
@@ -256,7 +266,9 @@ def clean_locale_files(resources_path):
         os.path.join(resources_path, "zh-TW.json"),
         os.path.join(resources_path, "zh-Hant.json"),
         os.path.join(resources_path, "ion-dist", "i18n", "statsig", "zh-TW.json"),
-        os.path.join(resources_path, "ion-dist", "i18n", "statsig", "zh-Hant.json")
+        os.path.join(resources_path, "ion-dist", "i18n", "statsig", "zh-Hant.json"),
+        os.path.join(resources_path, "ion-dist", "i18n", "dynamic", "zh-TW.json"),
+        os.path.join(resources_path, "ion-dist", "i18n", "dynamic", "zh-Hant.json")
     ]
     for t in targets:
         if os.path.exists(t):

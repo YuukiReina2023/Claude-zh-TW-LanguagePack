@@ -79,9 +79,10 @@ Claude_zh-TW_LanguagePack/
 ├── LanguagePack.py               # 跨平台 (macOS / Linux / Windows) 安裝與守護腳本
 │
 ├── locales/                      # 臺灣正體中文在地化語系檔案目錄
-│   ├── ion-dist.json             # 前端完整介面在地化 (18,363 條詞條)
+│   ├── ion-dist.json             # 前端完整介面在地化 (全量 41,699 條詞條，0 遺漏)
 │   ├── desktop-shell.json        # 視窗外框與系統功能表選單在地化 (837 條詞條)
-│   ├── statsig.json              # 模型特徵與功能描述
+│   ├── dynamic.json              # 模型深度推理與動態控制文案 (49 條詞條)
+│   ├── statsig.json              # 模型特徵與功能提示文案 (72 條詞條)
 │   ├── overrides.json            # 預防前端 404 的佔位設定檔
 │   └── Localizable.strings       # macOS 系統原生對話框與存取權限提示
 │
