@@ -220,13 +220,18 @@ def patch_js_language(resources_path, silent=False):
         return False
 
     pattern = re.compile(r'((?:[\w$]+)=\["en-US"(?:,"[^"]+")+)(\])')
-    js_files = glob.glob(os.path.join(assets_dir, "*.js"))
-    patched = False
+    # 優先檢索 shared-*.js（白名單位於 shared-*.js 中），若無則掃描所有 js
+    js_files = glob.glob(os.path.join(assets_dir, "shared-*.js"))
+    if not js_files:
+        js_files = glob.glob(os.path.join(assets_dir, "*.js"))
 
+    patched = False
     for js in js_files:
         try:
-            with open(js, "r", encoding="utf-8") as f:
+            with open(js, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read()
+            if '["en-US"' not in content:
+                continue
             if '"zh-TW"' in content:
                 if not silent:
                     print(f"  已註冊語言: {os.path.basename(js)}")
@@ -252,11 +257,13 @@ def unpatch_js_language(resources_path, silent=False):
         return
 
     pattern = re.compile(r'((?:[\w$]+)=\[(?:"[^"]+",)+)"zh-TW"\]')
-    js_files = glob.glob(os.path.join(assets_dir, "*.js"))
+    js_files = glob.glob(os.path.join(assets_dir, "shared-*.js"))
+    if not js_files:
+        js_files = glob.glob(os.path.join(assets_dir, "*.js"))
 
     for js in js_files:
         try:
-            with open(js, "r", encoding="utf-8") as f:
+            with open(js, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read()
             if '"zh-TW"' not in content:
                 continue

@@ -241,6 +241,20 @@ function Get-BackupPath {
     return (Join-Path $backupDir $relative)
 }
 
+function Grant-DirectoryAccessRecursive {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    if (-not $identity) { return }
+
+    try {
+        & takeown.exe /f $Path /r /d Y >$null 2>&1
+        & icacls.exe $Path /grant "${identity}:(OI)(CI)F" /t /c /q >$null 2>&1
+        & attrib.exe -R "$Path\*.*" /S /D >$null 2>&1
+    } catch {}
+}
+
 function Patch-JsLanguage {
     param(
         [Parameter(Mandatory = $true)][string]$ResourcesPath,
@@ -252,18 +266,21 @@ function Patch-JsLanguage {
         return $false
     }
 
-    $jsFiles = Get-ChildItem -LiteralPath $assetsDir -Filter "*.js" -File -ErrorAction SilentlyContinue
-    if (-not $jsFiles) {
-        if (-not $Silent) { Write-Host "  [警告] 找不到 JS 檔案，跳過 JS 補丁" -ForegroundColor Yellow }
-        return $false
+    # 優先檢索 shared-*.js（99% 語言白名單位於 shared-*.js 中），若無則掃描所有 js
+    $jsFiles = Get-ChildItem -LiteralPath $assetsDir -Filter "shared-*.js" -File -ErrorAction SilentlyContinue
+    if (-not $jsFiles -or $jsFiles.Count -eq 0) {
+        $jsFiles = Get-ChildItem -LiteralPath $assetsDir -Filter "*.js" -File -ErrorAction SilentlyContinue
     }
 
     $regexAdd = [regex]'((?:[\w$]+)=\["en-US"(?:,"[^"]+")+)\]'
     $patched = $false
 
     foreach ($jsFile in $jsFiles) {
-        Grant-WriteAccess -Path $jsFile.FullName
         $content = [System.IO.File]::ReadAllText($jsFile.FullName)
+        if (-not $content.Contains('["en-US"')) {
+            continue
+        }
+
         if ($content.Contains('"zh-TW"')) {
             if (-not $Silent) { Write-Host "  已註冊語言: $($jsFile.Name)" -ForegroundColor DarkGray }
             $patched = $true
@@ -276,7 +293,6 @@ function Patch-JsLanguage {
             Write-Utf8File -Path $jsFile.FullName -Content $newContent
             if (-not $Silent) { Write-Host "  JS 語言白名單已修補: $($jsFile.Name)" -ForegroundColor Green }
             $patched = $true
-            continue
         }
     }
     return $patched
@@ -289,19 +305,21 @@ function Unpatch-JsLanguage {
         return
     }
 
-    $jsFiles = Get-ChildItem -LiteralPath $assetsDir -Filter "*.js" -File -ErrorAction SilentlyContinue
+    $jsFiles = Get-ChildItem -LiteralPath $assetsDir -Filter "shared-*.js" -File -ErrorAction SilentlyContinue
+    if (-not $jsFiles -or $jsFiles.Count -eq 0) {
+        $jsFiles = Get-ChildItem -LiteralPath $assetsDir -Filter "*.js" -File -ErrorAction SilentlyContinue
+    }
+
     $regexRemove = [regex]'((?:[\w$]+)=\[(?:"[^"]+",)+)"zh-TW"\]'
 
     foreach ($jsFile in $jsFiles) {
         $backupPath = Get-BackupPath -OriginalPath $jsFile.FullName -RelativeTo $ResourcesPath
         if (Test-Path -LiteralPath $backupPath -PathType Leaf) {
-            Grant-WriteAccess -Path $jsFile.FullName
             Copy-Item -LiteralPath $backupPath -Destination $jsFile.FullName -Force
             Write-Host "  從備份還原: $($jsFile.Name)" -ForegroundColor Green
             continue
         }
 
-        Grant-WriteAccess -Path $jsFile.FullName
         $content = [System.IO.File]::ReadAllText($jsFile.FullName)
         if (-not $content.Contains('"zh-TW"')) {
             continue
@@ -490,22 +508,7 @@ function Do-Install {
         Write-Host "[2/6] 取得目錄寫入權限..."
     }
 
-    $pathsToGrant = @(
-        $resourcesPath,
-        (Join-Path $resourcesPath "ion-dist"),
-        (Join-Path $resourcesPath "ion-dist\i18n"),
-        (Join-Path $resourcesPath "ion-dist\i18n\statsig"),
-        (Join-Path $resourcesPath "ion-dist\assets"),
-        (Join-Path $resourcesPath "ion-dist\assets\v1")
-    )
-    foreach ($p in $pathsToGrant) {
-        Grant-WriteAccess -Path $p
-    }
-    $assetsDir = Join-Path $resourcesPath "ion-dist\assets\v1"
-    if (Test-Path -LiteralPath $assetsDir -PathType Container) {
-        Get-ChildItem -LiteralPath $assetsDir -Filter "*.js" -File -ErrorAction SilentlyContinue |
-            ForEach-Object { Grant-WriteAccess -Path $_.FullName }
-    }
+    Grant-DirectoryAccessRecursive -Path $resourcesPath
 
     if (-not $SilentInstall) {
         Write-Host "  目錄權限解鎖完成" -ForegroundColor Green
