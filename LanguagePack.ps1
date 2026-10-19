@@ -1,5 +1,6 @@
 ﻿[CmdletBinding()]
 param(
+    [string]$Path = "",
     [switch]$Install,
     [switch]$Uninstall,
     [switch]$AutoHeal,
@@ -102,45 +103,164 @@ function Decompress-B64GzToFile {
 }
 
 function Find-ClaudePath {
-    # 1. 優先查詢 Windows Store / MSIX 封裝版本
+    param([string]$ManualPath = "")
+
+    # 0. 手動指定路徑優先
+    if ($ManualPath -and (Test-Path -LiteralPath $ManualPath)) {
+        if (Test-Path -LiteralPath (Join-Path $ManualPath "app\resources")) { return $ManualPath }
+        if (Test-Path -LiteralPath (Join-Path $ManualPath "resources")) { return $ManualPath }
+        if (Split-Path $ManualPath -Leaf -ieq "resources") {
+            $p = Split-Path $ManualPath -Parent
+            if (Split-Path $p -Leaf -ieq "app") { return (Split-Path $p -Parent) }
+            return $p
+        }
+        return $ManualPath
+    }
+
+    # 1. 執行中行程即時動態偵測 (無論安裝於任何磁碟槽 C/D/E，只要正在執行即可精準定位實體路徑)
     try {
-        $pkg = Get-AppxPackage -Name Claude -ErrorAction Stop |
-            Sort-Object Version -Descending |
-            Select-Object -First 1
-        if ($pkg -and $pkg.InstallLocation -and (Test-Path -LiteralPath $pkg.InstallLocation)) {
-            return $pkg.InstallLocation
+        $runningProcesses = Get-Process -Name "claude" -ErrorAction SilentlyContinue
+        foreach ($proc in $runningProcesses) {
+            try {
+                $mainModule = $proc.MainModule.FileName
+                if ($mainModule -and (Test-Path -LiteralPath $mainModule)) {
+                    $dir = Split-Path -Parent $mainModule
+                    if (Split-Path $dir -Leaf -ieq "app") {
+                        $root = Split-Path $dir -Parent
+                        if (Test-Path -LiteralPath (Join-Path $root "app\resources")) { return $root }
+                    }
+                    if (Test-Path -LiteralPath (Join-Path $dir "resources")) { return $dir }
+                    if (Test-Path -LiteralPath (Join-Path $dir "app\resources")) { return $dir }
+                }
+            } catch {}
         }
     } catch {}
 
-    # 2. 查詢 Appx 註冊表部署目錄
+    # 2. Windows Store / MSIX 套件動態查詢 (支援任意 Publisher ID 與不同版本)
     try {
-        $deployments = Get-ChildItem "HKLM:\Software\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\Deployments" -ErrorAction Stop |
-            Where-Object { $_.PSChildName -like "Claude*" } |
-            Sort-Object PSChildName -Descending
-        foreach ($deployment in $deployments) {
-            $candidate = Join-Path ${env:ProgramFiles} "WindowsApps\$($deployment.PSChildName)"
-            if (Test-Path -LiteralPath $candidate) {
-                return $candidate
+        $pkgs = Get-AppxPackage -Name "*Claude*" -ErrorAction SilentlyContinue |
+            Sort-Object Version -Descending
+        foreach ($pkg in $pkgs) {
+            if ($pkg.InstallLocation -and (Test-Path -LiteralPath $pkg.InstallLocation)) {
+                if (Test-Path -LiteralPath (Join-Path $pkg.InstallLocation "app\resources")) {
+                    return $pkg.InstallLocation
+                }
             }
         }
     } catch {}
 
-    # 3. 掃描 WindowsApps 系統目錄
-    $windowsApps = Join-Path ${env:ProgramFiles} "WindowsApps"
-    if (Test-Path -LiteralPath $windowsApps) {
-        $candidate = Get-ChildItem -LiteralPath $windowsApps -Directory -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -like "Claude*" } |
-            Sort-Object Name -Descending |
-            Select-Object -First 1
-        if ($candidate) {
-            return $candidate.FullName
+    # 3. 系統 Appx 註冊表部署全量檢索 (覆蓋所有使用者安裝的所有 Claude 套件)
+    try {
+        $regDeployPaths = @(
+            "HKLM:\Software\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\Deployments",
+            "HKLM:\Software\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\InboxApplications"
+        )
+        foreach ($regPath in $regDeployPaths) {
+            if (Test-Path -LiteralPath $regPath) {
+                $deployments = Get-ChildItem -LiteralPath $regPath -ErrorAction SilentlyContinue |
+                    Where-Object { $_.PSChildName -like "*Claude*" } |
+                    Sort-Object PSChildName -Descending
+                foreach ($dep in $deployments) {
+                    foreach ($drive in [System.IO.DriveInfo]::GetDrives() | Where-Object { $_.IsReady -and $_.DriveType -eq 'Fixed' }) {
+                        $candidate = Join-Path $drive.RootDirectory.FullName "Program Files\WindowsApps\$($dep.PSChildName)"
+                        if (Test-Path -LiteralPath (Join-Path $candidate "app\resources")) {
+                            return $candidate
+                        }
+                        $candidate2 = Join-Path $drive.RootDirectory.FullName "WindowsApps\$($dep.PSChildName)"
+                        if (Test-Path -LiteralPath (Join-Path $candidate2 "app\resources")) {
+                            return $candidate2
+                        }
+                    }
+                }
+            }
         }
-    }
+    } catch {}
 
-    # 4. 掃描 LocalAppData Squirrel / 一般桌面版本
-    $localClaude = Join-Path ${env:LOCALAPPDATA} "Programs\Claude"
-    if (Test-Path -LiteralPath $localClaude) {
-        return $localClaude
+    # 4. Windows 卸載註冊表動態檢索 (支援自訂路徑安裝、桌面標準安裝)
+    try {
+        $uninstallKeys = @(
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+            "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+            "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+        )
+        foreach ($k in $uninstallKeys) {
+            $items = Get-ItemProperty -Path $k -ErrorAction SilentlyContinue |
+                Where-Object { $_.DisplayName -like "*Claude*" }
+            foreach ($item in $items) {
+                if ($item.InstallLocation -and (Test-Path -LiteralPath $item.InstallLocation)) {
+                    $res = Join-Path $item.InstallLocation "resources"
+                    $appRes = Join-Path $item.InstallLocation "app\resources"
+                    if ((Test-Path -LiteralPath $res) -or (Test-Path -LiteralPath $appRes)) {
+                        return $item.InstallLocation
+                    }
+                }
+                if ($item.DisplayIcon -and (Test-Path -LiteralPath $item.DisplayIcon)) {
+                    $dir = Split-Path -Parent $item.DisplayIcon
+                    if (Split-Path $dir -Leaf -ieq "app") {
+                        $root = Split-Path $dir -Parent
+                        if (Test-Path -LiteralPath (Join-Path $root "app\resources")) { return $root }
+                    }
+                    if (Test-Path -LiteralPath (Join-Path $dir "resources")) { return $dir }
+                }
+            }
+        }
+    } catch {}
+
+    # 5. 開始功能表捷徑動態解析 (.lnk 解析實際 target)
+    try {
+        $wsh = New-Object -ComObject WScript.Shell
+        $lnkDirs = @(
+            (Join-Path ${env:APPDATA} "Microsoft\Windows\Start Menu\Programs"),
+            (Join-Path ${env:ProgramData} "Microsoft\Windows\Start Menu\Programs")
+        )
+        foreach ($ld in $lnkDirs) {
+            if (Test-Path -LiteralPath $ld) {
+                $lnks = Get-ChildItem -LiteralPath $ld -Filter "*Claude*.lnk" -Recurse -File -ErrorAction SilentlyContinue
+                foreach ($lnk in $lnks) {
+                    try {
+                        $target = $wsh.CreateShortcut($lnk.FullName).TargetPath
+                        if ($target -and (Test-Path -LiteralPath $target)) {
+                            $dir = Split-Path -Parent $target
+                            if (Split-Path $dir -Leaf -ieq "app") {
+                                $root = Split-Path $dir -Parent
+                                if (Test-Path -LiteralPath (Join-Path $root "app\resources")) { return $root }
+                            }
+                            if (Test-Path -LiteralPath (Join-Path $dir "resources")) { return $dir }
+                        }
+                    } catch {}
+                }
+            }
+        }
+    } catch {}
+
+    # 6. 全磁碟常見安裝路徑動態掃描 (C:, D:, E:, etc.)
+    $fixedDrives = [System.IO.DriveInfo]::GetDrives() | Where-Object { $_.IsReady -and $_.DriveType -eq 'Fixed' }
+    foreach ($drive in $fixedDrives) {
+        $root = $drive.RootDirectory.FullName
+        $candidates = @(
+            (Join-Path $root "Program Files\WindowsApps"),
+            (Join-Path $root "Program Files\Claude"),
+            (Join-Path $root "Program Files\Anthropic\Claude"),
+            (Join-Path $root "Program Files (x86)\Claude"),
+            (Join-Path $root "Program Files (x86)\Anthropic\Claude"),
+            (Join-Path ${env:LOCALAPPDATA} "Programs\Claude"),
+            (Join-Path ${env:LOCALAPPDATA} "Claude")
+        )
+        foreach ($c in $candidates) {
+            if (-not (Test-Path -LiteralPath $c)) { continue }
+            if ($c -like "*WindowsApps") {
+                $appxDirs = Get-ChildItem -LiteralPath $c -Directory -Filter "*Claude*" -ErrorAction SilentlyContinue |
+                    Sort-Object Name -Descending
+                foreach ($ad in $appxDirs) {
+                    if (Test-Path -LiteralPath (Join-Path $ad.FullName "app\resources")) {
+                        return $ad.FullName
+                    }
+                }
+            } else {
+                if (Test-Path -LiteralPath (Join-Path $c "resources")) { return $c }
+                if (Test-Path -LiteralPath (Join-Path $c "app\resources")) { return $c }
+            }
+        }
     }
 
     return $null
@@ -148,61 +268,34 @@ function Find-ClaudePath {
 
 function Get-ResourcesPath {
     param([Parameter(Mandatory = $true)][string]$ClaudePath)
-    $resourcesPath = Join-Path $ClaudePath "app\resources"
-    if (Test-Path -LiteralPath $resourcesPath) {
-        return $resourcesPath
-    }
-    $resourcesDirect = Join-Path $ClaudePath "resources"
-    if (Test-Path -LiteralPath $resourcesDirect) {
-        return $resourcesDirect
-    }
+    $res1 = Join-Path $ClaudePath "app\resources"
+    if (Test-Path -LiteralPath $res1) { return $res1 }
+    $res2 = Join-Path $ClaudePath "resources"
+    if (Test-Path -LiteralPath $res2) { return $res2 }
+    if (Split-Path $ClaudePath -Leaf -ieq "resources") { return $ClaudePath }
     return $null
 }
 
 function Grant-WriteAccess {
-    param([Parameter(Mandatory = $true)][string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) {
-        return
-    }
-    $item = Get-Item -LiteralPath $Path -ErrorAction Stop
-    $takeownArgs = @("/f", $Path, "/a")
-    if ($item.PSIsContainer) {
-        $takeownArgs += @("/r", "/d", "Y")
-    }
-    $takeownOutput = & takeown.exe @takeownArgs 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw "無法取得寫入權限 (takeown 失敗): $Path`n$($takeownOutput -join "`n")"
-    }
-
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [switch]$Recursive
+    )
+    if (-not (Test-Path -LiteralPath $Path)) { return }
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-    if (-not $identity) {
-        throw "無法確定目前 Windows 使用者，無法授予寫入權限: $Path"
-    }
+    if (-not $identity) { return }
 
-    $icaclsArgs = @($Path, "/grant", "${identity}:F")
-    if ($item.PSIsContainer) {
-        $icaclsArgs += @("/t", "/c")
-    }
-    $icaclsOutput = & icacls.exe @icaclsArgs 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw "無法授予寫入權限 (icacls 失敗): $Path`n$($icaclsOutput -join "`n")"
-    }
-
-    if ($item.PSIsContainer) {
-        $inheritOutput = & icacls.exe $Path "/grant" "${identity}:(OI)(CI)F" 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw "無法設定目錄權限繼承 (icacls 失敗): $Path`n$($inheritOutput -join "`n")"
+    try {
+        if ($Recursive) {
+            & takeown.exe /f $Path /r /d Y >$null 2>&1
+            & icacls.exe $Path /grant "${identity}:(OI)(CI)F" /t /c /q >$null 2>&1
+            & attrib.exe -R "$Path\*.*" /S /D >$null 2>&1
+        } else {
+            & takeown.exe /f $Path /a >$null 2>&1
+            & icacls.exe $Path /grant "${identity}:(OI)(CI)F" /q >$null 2>&1
+            & attrib.exe -R $Path >$null 2>&1
         }
-    }
-
-    $attribArgs = @("-R", $Path)
-    if ($item.PSIsContainer) {
-        $attribArgs += @("/S", "/D")
-    }
-    $attribOutput = & attrib.exe @attribArgs 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw "無法移除唯讀屬性 (attrib 失敗): $Path`n$($attribOutput -join "`n")"
-    }
+    } catch {}
 }
 
 function Backup-File {
@@ -245,14 +338,18 @@ function Grant-DirectoryAccessRecursive {
     param([Parameter(Mandatory = $true)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return }
 
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-    if (-not $identity) { return }
+    # 1. 解鎖 resources 根目錄 (供寫入 zh-TW.json)
+    Grant-WriteAccess -Path $Path
 
-    try {
-        & takeown.exe /f $Path /r /d Y >$null 2>&1
-        & icacls.exe $Path /grant "${identity}:(OI)(CI)F" /t /c /q >$null 2>&1
-        & attrib.exe -R "$Path\*.*" /S /D >$null 2>&1
-    } catch {}
+    # 2. 解鎖 ion-dist 與 i18n 語系目錄
+    $ionDist = Join-Path $Path "ion-dist"
+    if (Test-Path -LiteralPath $ionDist) { Grant-WriteAccess -Path $ionDist }
+
+    $i18nDir = Join-Path $Path "ion-dist\i18n"
+    if (Test-Path -LiteralPath $i18nDir) { Grant-WriteAccess -Path $i18nDir -Recursive }
+
+    $assetsDir = Join-Path $Path "ion-dist\assets\v1"
+    if (Test-Path -LiteralPath $assetsDir) { Grant-WriteAccess -Path $assetsDir }
 }
 
 function Patch-JsLanguage {
@@ -289,6 +386,7 @@ function Patch-JsLanguage {
 
         $newContent = $regexAdd.Replace($content, '$1,"zh-TW"]', 1)
         if ($newContent -ne $content) {
+            Grant-WriteAccess -Path $jsFile.FullName
             Backup-File -Path $jsFile.FullName -RelativeTo $ResourcesPath
             Write-Utf8File -Path $jsFile.FullName -Content $newContent
             if (-not $Silent) { Write-Host "  JS 語言白名單已修補: $($jsFile.Name)" -ForegroundColor Green }
@@ -315,6 +413,7 @@ function Unpatch-JsLanguage {
     foreach ($jsFile in $jsFiles) {
         $backupPath = Get-BackupPath -OriginalPath $jsFile.FullName -RelativeTo $ResourcesPath
         if (Test-Path -LiteralPath $backupPath -PathType Leaf) {
+            Grant-WriteAccess -Path $jsFile.FullName
             Copy-Item -LiteralPath $backupPath -Destination $jsFile.FullName -Force
             Write-Host "  從備份還原: $($jsFile.Name)" -ForegroundColor Green
             continue
@@ -326,6 +425,7 @@ function Unpatch-JsLanguage {
         }
         $newContent = $regexRemove.Replace($content, '$1]', 1)
         if ($newContent -ne $content) {
+            Grant-WriteAccess -Path $jsFile.FullName
             Write-Utf8File -Path $jsFile.FullName -Content $newContent
             Write-Host "  語言註冊已還原: $($jsFile.Name)" -ForegroundColor Green
         }
@@ -341,16 +441,33 @@ function Update-Config {
         [Parameter(Mandatory = $true)][string]$Locale,
         [switch]$Silent
     )
-    $base = Join-Path ${env:LOCALAPPDATA} "Packages\Claude_pzs8sxrjxfjjc"
-    $configPaths = @(
-        (Join-Path $base "LocalCache\Roaming\Claude\config.json"),
-        (Join-Path $base "LocalCache\Roaming\Claude-3p\config.json"),
-        (Join-Path ${env:APPDATA} "Claude\config.json")
+    $configPaths = [System.Collections.Generic.List[string]]::new()
+
+    # 1. 掃描標準 AppData 目錄
+    $appDataConfigs = @(
+        (Join-Path ${env:APPDATA} "Claude\config.json"),
+        (Join-Path ${env:APPDATA} "Claude-3p\config.json"),
+        (Join-Path ${env:LOCALAPPDATA} "Claude\config.json")
     )
-    foreach ($configPath in $configPaths) {
-        if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
-            continue
+    foreach ($cfg in $appDataConfigs) {
+        if (Test-Path -LiteralPath $cfg -PathType Leaf) {
+            $configPaths.Add($cfg)
         }
+    }
+
+    # 2. 動態遍歷 LocalAppData\Packages 下所有 Claude 套件（絕不寫死 PackageFamilyName）
+    $packagesDir = Join-Path ${env:LOCALAPPDATA} "Packages"
+    if (Test-Path -LiteralPath $packagesDir -PathType Container) {
+        $claudePackages = Get-ChildItem -LiteralPath $packagesDir -Directory -Filter "*Claude*" -ErrorAction SilentlyContinue
+        foreach ($pkgDir in $claudePackages) {
+            $c1 = Join-Path $pkgDir.FullName "LocalCache\Roaming\Claude\config.json"
+            $c2 = Join-Path $pkgDir.FullName "LocalCache\Roaming\Claude-3p\config.json"
+            if (Test-Path -LiteralPath $c1 -PathType Leaf) { $configPaths.Add($c1) }
+            if (Test-Path -LiteralPath $c2 -PathType Leaf) { $configPaths.Add($c2) }
+        }
+    }
+
+    foreach ($configPath in $configPaths) {
         try {
             $raw = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8
             if ($raw -match '"locale"\s*:') {
@@ -362,11 +479,7 @@ function Update-Config {
             if (-not $Silent) {
                 Write-Host "  偏好設定更新成功: $(Split-Path $configPath -Leaf) (語言: $Locale)" -ForegroundColor Green
             }
-        } catch {
-            if (-not $Silent) {
-                Write-Host "  [警告] 偏好設定更新失敗: $(Split-Path $configPath -Leaf)" -ForegroundColor Yellow
-            }
-        }
+        } catch {}
     }
 }
 
@@ -404,11 +517,14 @@ function Test-NeedsHeal {
 
     $assetsDir = Join-Path $ResourcesPath "ion-dist\assets\v1"
     if (Test-Path -LiteralPath $assetsDir -PathType Container) {
-        $jsFiles = Get-ChildItem -LiteralPath $assetsDir -Filter "*.js" -File -ErrorAction SilentlyContinue
+        $jsFiles = Get-ChildItem -LiteralPath $assetsDir -Filter "shared-*.js" -File -ErrorAction SilentlyContinue
+        if (-not $jsFiles -or $jsFiles.Count -eq 0) {
+            $jsFiles = Get-ChildItem -LiteralPath $assetsDir -Filter "*.js" -File -ErrorAction SilentlyContinue
+        }
         $patched = $false
         foreach ($js in $jsFiles) {
             $txt = [System.IO.File]::ReadAllText($js.FullName)
-            if ($txt.Contains('"zh-TW"')) {
+            if ($txt.Contains('["en-US"') -and $txt.Contains('"zh-TW"')) {
                 $patched = $true
                 break
             }
@@ -443,34 +559,55 @@ function Do-AutoHeal {
 }
 
 function Restart-Claude {
+    param([string]$ClaudePath = "")
     try {
         Stop-Process -Name "claude" -Force -ErrorAction SilentlyContinue
     } catch {}
     Start-Sleep -Seconds 2
 
-    $claudePath = Find-ClaudePath
-    if (-not $claudePath) { return }
+    if (-not $ClaudePath) { $ClaudePath = Find-ClaudePath }
+    if (-not $ClaudePath) { return }
 
-    # 嘗試透過 AppsFolder 啟動 MSIX
-    try {
-        [xml]$manifest = Get-Content -LiteralPath (Join-Path $claudePath "AppxManifest.xml") -Raw
-        $appId = [string]$manifest.Package.Applications.Application.Id
-        $identity = [string]$manifest.Package.Identity.Name
-        $folderLeaf = Split-Path -Leaf $claudePath
-        if ($folderLeaf -match "__([^_]+)$") {
-            $pfn = "$identity`_$($Matches[1])"
-            Start-Process "explorer.exe" "shell:AppsFolder\$pfn!$appId" | Out-Null
+    # 1. 嘗試透過 AppxManifest.xml 動態解析啟動
+    $manifestPath = Join-Path $ClaudePath "AppxManifest.xml"
+    if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
+        try {
+            [xml]$manifest = Get-Content -LiteralPath $manifestPath -Raw
+            $appId = [string]$manifest.Package.Applications.Application.Id
+            $identity = [string]$manifest.Package.Identity.Name
+
+            $pfn = ""
+            $pkg = Get-AppxPackage -Name "*$identity*" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($pkg -and $pkg.PackageFamilyName) {
+                $pfn = $pkg.PackageFamilyName
+            } else {
+                $folderLeaf = Split-Path -Leaf $ClaudePath
+                if ($folderLeaf -match "__([^_]+)$") {
+                    $pfn = "$identity`_$($Matches[1])"
+                }
+            }
+            if ($pfn -and $appId) {
+                Start-Process "explorer.exe" "shell:AppsFolder\$pfn!$appId" | Out-Null
+                Start-Sleep -Seconds 3
+                Write-Host "Claude Desktop 已重新啟動！" -ForegroundColor Green
+                return
+            }
+        } catch {}
+    }
+
+    # 2. 尋找 claude.exe
+    $exeCandidates = @(
+        (Join-Path $ClaudePath "app\claude.exe"),
+        (Join-Path $ClaudePath "claude.exe"),
+        (Join-Path $ClaudePath "Claude.exe")
+    )
+    foreach ($exe in $exeCandidates) {
+        if (Test-Path -LiteralPath $exe) {
+            Start-Process "explorer.exe" "`"$exe`"" | Out-Null
             Start-Sleep -Seconds 3
             Write-Host "Claude Desktop 已重新啟動！" -ForegroundColor Green
             return
         }
-    } catch {}
-
-    $exe = Join-Path $claudePath "app\claude.exe"
-    if (Test-Path -LiteralPath $exe) {
-        Start-Process "explorer.exe" "`"$exe`"" | Out-Null
-        Start-Sleep -Seconds 3
-        Write-Host "Claude Desktop 已重新啟動！" -ForegroundColor Green
     }
 }
 
@@ -493,9 +630,20 @@ function Do-Install {
         Write-Host "[1/6] 尋找 Claude Desktop 安裝目錄..."
     }
 
-    $claudePath = Find-ClaudePath
+    $claudePath = Find-ClaudePath -ManualPath $Path
     if (-not $claudePath) {
-        throw "未偵測到已安裝的 Claude Desktop！請先安裝 Claude Desktop。"
+        if (-not $SilentInstall) {
+            Write-Host ""
+            Write-Host "  [提示] 系統多層動態檢索未能自動鎖定 Claude 安裝目錄。" -ForegroundColor Yellow
+            $userInput = Read-Host "請輸入或拖曳 Claude 安裝目錄 (例如 C:\Program Files\WindowsApps\Claude... 或 D:\Claude)"
+            if ($userInput) {
+                $userInput = $userInput.Trim('"', "'", " ")
+                $claudePath = Find-ClaudePath -ManualPath $userInput
+            }
+        }
+    }
+    if (-not $claudePath) {
+        throw "未偵測到已安裝的 Claude Desktop！請確認 Claude Desktop 是否已安裝。"
     }
     $resourcesPath = Get-ResourcesPath -ClaudePath $claudePath
     if (-not $resourcesPath) {
@@ -638,6 +786,9 @@ function Do-Uninstall {
 }
 
 $scriptArgs = @()
+if ($Path) {
+    $scriptArgs += @("-Path", "`"$Path`"")
+}
 if ($Uninstall) {
     $scriptArgs += "-Uninstall"
 }
