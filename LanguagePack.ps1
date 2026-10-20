@@ -94,6 +94,7 @@ function Decompress-B64GzToFile {
     if ($parent -and -not (Test-Path -LiteralPath $parent)) {
         [System.IO.Directory]::CreateDirectory($parent) | Out-Null
     }
+    Grant-ExistingFileWriteAccess -Path $OutPath
     $bytes = [System.Convert]::FromBase64String($Base64)
     $ms = [System.IO.MemoryStream]::new($bytes)
     $gz = [System.IO.Compression.GzipStream]::new($ms, [System.IO.Compression.CompressionMode]::Decompress)
@@ -287,17 +288,34 @@ function Grant-WriteAccess {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
     if (-not $identity) { return }
 
-    try {
-        if ($Recursive) {
-            & takeown.exe /f $Path /r /d Y >$null 2>&1
-            & icacls.exe $Path /grant "${identity}:(OI)(CI)F" /t /c /q >$null 2>&1
-            & attrib.exe -R "$Path\*.*" /S /D >$null 2>&1
-        } else {
-            & takeown.exe /f $Path /a >$null 2>&1
+    $isContainer = Test-Path -LiteralPath $Path -PathType Container
+    $icaclsExitCode = 0
+    if ($isContainer -and $Recursive) {
+        & takeown.exe /f $Path /r /d Y >$null 2>&1
+        & icacls.exe $Path /grant "${identity}:(OI)(CI)F" /t /c /q >$null 2>&1
+        $icaclsExitCode = $LASTEXITCODE
+        & attrib.exe -R "$Path\*.*" /S /D >$null 2>&1
+    } else {
+        & takeown.exe /f $Path /a >$null 2>&1
+        if ($isContainer) {
             & icacls.exe $Path /grant "${identity}:(OI)(CI)F" /q >$null 2>&1
-            & attrib.exe -R $Path >$null 2>&1
+        } else {
+            & icacls.exe $Path /grant "${identity}:F" /q >$null 2>&1
         }
-    } catch {}
+        $icaclsExitCode = $LASTEXITCODE
+        & attrib.exe -R $Path >$null 2>&1
+    }
+
+    if ($icaclsExitCode -ne 0) {
+        throw "無法授予目前使用者對路徑的寫入權限: $Path (icacls 結束代碼: $icaclsExitCode)。請確認已核准系統管理員權限，並關閉 Claude Desktop 後重試。"
+    }
+}
+
+function Grant-ExistingFileWriteAccess {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        Grant-WriteAccess -Path $Path
+    }
 }
 
 function Backup-File {
@@ -675,14 +693,20 @@ function Do-Install {
         if (-not $SilentInstall) {
             Write-Host "  [來源] 優先載入 locales 目錄語系檔案..." -ForegroundColor Cyan
         }
-        Copy-Item -LiteralPath (Join-Path $localesDir "ion-dist.json") -Destination (Join-Path $resourcesPath "ion-dist\i18n\zh-TW.json") -Force
-        Copy-Item -LiteralPath (Join-Path $localesDir "ion-dist.json") -Destination (Join-Path $resourcesPath "ion-dist\i18n\zh-Hant.json") -Force
-        Copy-Item -LiteralPath (Join-Path $localesDir "desktop-shell.json") -Destination (Join-Path $resourcesPath "zh-TW.json") -Force
-        Copy-Item -LiteralPath (Join-Path $localesDir "desktop-shell.json") -Destination (Join-Path $resourcesPath "zh-Hant.json") -Force
-        Copy-Item -LiteralPath (Join-Path $localesDir "statsig.json") -Destination (Join-Path $resourcesPath "ion-dist\i18n\statsig\zh-TW.json") -Force
-        Copy-Item -LiteralPath (Join-Path $localesDir "statsig.json") -Destination (Join-Path $resourcesPath "ion-dist\i18n\statsig\zh-Hant.json") -Force
-        Copy-Item -LiteralPath (Join-Path $localesDir "dynamic.json") -Destination (Join-Path $resourcesPath "ion-dist\i18n\dynamic\zh-TW.json") -Force
-        Copy-Item -LiteralPath (Join-Path $localesDir "dynamic.json") -Destination (Join-Path $resourcesPath "ion-dist\i18n\dynamic\zh-Hant.json") -Force
+        $localeFiles = @(
+            @{ Source = "ion-dist.json"; Destinations = @("ion-dist\i18n\zh-TW.json", "ion-dist\i18n\zh-Hant.json") },
+            @{ Source = "desktop-shell.json"; Destinations = @("zh-TW.json", "zh-Hant.json") },
+            @{ Source = "statsig.json"; Destinations = @("ion-dist\i18n\statsig\zh-TW.json", "ion-dist\i18n\statsig\zh-Hant.json") },
+            @{ Source = "dynamic.json"; Destinations = @("ion-dist\i18n\dynamic\zh-TW.json", "ion-dist\i18n\dynamic\zh-Hant.json") }
+        )
+        foreach ($localeFile in $localeFiles) {
+            $sourcePath = Join-Path $localesDir $localeFile.Source
+            foreach ($relativeDestination in $localeFile.Destinations) {
+                $destinationPath = Join-Path $resourcesPath $relativeDestination
+                Grant-ExistingFileWriteAccess -Path $destinationPath
+                Copy-Item -LiteralPath $sourcePath -Destination $destinationPath -Force
+            }
+        }
     } else {
         if (-not $SilentInstall) {
             Write-Host "  [來源] 載入腳本內建臺灣正體中文資源庫..." -ForegroundColor Cyan
@@ -698,6 +722,8 @@ function Do-Install {
     }
 
     # 寫入 overrides 佔位檔
+    Grant-ExistingFileWriteAccess -Path (Join-Path $resourcesPath "ion-dist\i18n\zh-TW.overrides.json")
+    Grant-ExistingFileWriteAccess -Path (Join-Path $resourcesPath "ion-dist\i18n\zh-Hant.overrides.json")
     Write-Utf8File -Path (Join-Path $resourcesPath "ion-dist\i18n\zh-TW.overrides.json") -Content "{}`n"
     Write-Utf8File -Path (Join-Path $resourcesPath "ion-dist\i18n\zh-Hant.overrides.json") -Content "{}`n"
 
