@@ -703,6 +703,10 @@ function Do-Install {
             $sourcePath = Join-Path $localesDir $localeFile.Source
             foreach ($relativeDestination in $localeFile.Destinations) {
                 $destinationPath = Join-Path $resourcesPath $relativeDestination
+                $destinationDirectory = Split-Path -Parent $destinationPath
+                if (-not (Test-Path -LiteralPath $destinationDirectory -PathType Container)) {
+                    [System.IO.Directory]::CreateDirectory($destinationDirectory) | Out-Null
+                }
                 Grant-ExistingFileWriteAccess -Path $destinationPath
                 Copy-Item -LiteralPath $sourcePath -Destination $destinationPath -Force
             }
